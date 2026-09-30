@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll } from 'bun:test';
 import { app } from '../src/index';
 import { prisma } from '../src/db/prisma';
+import { main as seedDatabase } from '../prisma/seed';
 
 let pmToken: string;
 let feToken: string;
@@ -12,13 +13,17 @@ let task3Id: string; // Frontend (IN_PROGRESS)
 let task4Id: string; // Blocked Frontend (BLOCKED by Task 3)
 
 beforeAll(async () => {
+  // Reset database to the canonical seeded state so tests are idempotent
+  // and never depend on leftovers from previous runs.
+  await seedDatabase();
+
   // 1. Get tokens for seeded users
   const pmRes = await app.request('/api/auth/quick-login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email: 'pm@nodewave.id' }),
   });
-  const pmData = await pmRes.json();
+  const pmData = (await pmRes.json()) as any;
   pmToken = pmData.data.token;
 
   const feRes = await app.request('/api/auth/quick-login', {
@@ -26,7 +31,7 @@ beforeAll(async () => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email: 'fe@nodewave.id' }),
   });
-  const feData = await feRes.json();
+  const feData = (await feRes.json()) as any;
   feToken = feData.data.token;
 
   const clientRes = await app.request('/api/auth/quick-login', {
@@ -34,7 +39,7 @@ beforeAll(async () => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email: 'client@acmecorp.com' }),
   });
-  const clientData = await clientRes.json();
+  const clientData = (await clientRes.json()) as any;
   clientToken = clientData.data.token;
 
   // Retrieve seeded project and tasks
@@ -68,7 +73,7 @@ describe('1. State-Based Permissions & Dependency Rules', () => {
     });
 
     expect(res.status).toBe(422);
-    const body = await res.json();
+    const body = (await res.json()) as any;
     expect(body.success).toBe(false);
     expect(body.error).toBe('TaskBlocked');
     expect(body.message).toContain('incomplete prerequisite dependencies');
@@ -91,7 +96,7 @@ describe('1. State-Based Permissions & Dependency Rules', () => {
     });
 
     expect(res.status).toBe(403);
-    const body = await res.json();
+    const body = (await res.json()) as any;
     expect(body.success).toBe(false);
     expect(body.message).toContain('Product Managers cannot mark tasks as Done');
   });
@@ -113,7 +118,7 @@ describe('1. State-Based Permissions & Dependency Rules', () => {
     });
 
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = (await res.json()) as any;
     expect(body.success).toBe(true);
     expect(body.data.status).toBe('DONE');
 
@@ -156,7 +161,7 @@ describe('2. Concurrency & Optimistic Locking', () => {
     });
 
     expect(res2.status).toBe(409);
-    const body2 = await res2.json();
+    const body2 = (await res2.json()) as any;
     expect(body2.success).toBe(false);
     expect(body2.error).toBe('Conflict');
   });
@@ -178,7 +183,7 @@ describe('3. Circular Dependency Detection (DAG)', () => {
     });
 
     expect(res.status).toBe(400);
-    const body = await res.json();
+    const body = (await res.json()) as any;
     expect(body.success).toBe(false);
     expect(body.error).toBe('CircularDependency');
   });
@@ -194,7 +199,7 @@ describe('4. Client Isolation & Data Masking', () => {
     });
 
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = (await res.json()) as any;
     expect(body.success).toBe(true);
 
     // All returned tasks must have isClientVisible === true
@@ -219,7 +224,7 @@ describe('4. Client Isolation & Data Masking', () => {
     });
 
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = (await res.json()) as any;
     expect(body.success).toBe(true);
     expect(body.data.percentageFormatted).toBeDefined();
     expect(body.data.completedTasks).toBeGreaterThanOrEqual(0);
@@ -237,7 +242,7 @@ describe('5. NodeWave Standard Filtering & Searching', () => {
     });
 
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = (await res.json()) as any;
     expect(body.success).toBe(true);
     for (const task of body.data) {
       expect(task.status).toBe('DONE');
@@ -254,7 +259,7 @@ describe('5. NodeWave Standard Filtering & Searching', () => {
     });
 
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = (await res.json()) as any;
     expect(body.success).toBe(true);
     expect(body.data.length).toBeGreaterThanOrEqual(1);
     expect(body.data[0].title).toContain('Design');
@@ -271,7 +276,7 @@ describe('6. Daily Standup Auto-Summary', () => {
     });
 
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = (await res.json()) as any;
     expect(body.success).toBe(true);
     expect(body.data.summary.completedYesterday).toBeDefined();
     expect(body.data.summary.blockedToday).toBeDefined();
