@@ -13,16 +13,20 @@
     "db:seed": "bun prisma/seed.ts",
     "db:generate": "prisma generate",
     "lint": "biome check src",
-    "format": "biome format --write src"
+    "format": "biome format --write src",
+    "prepare": "husky"
   },
   "prisma": {
     "seed": "bun prisma/seed.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.14",
+    "@commitlint/cli": "^21.2.3",
+    "@commitlint/config-conventional": "^21.2.3",
     "@types/bcryptjs": "^3.0.0",
     "@types/bun": "latest",
     "@types/jsonwebtoken": "^9.0.10",
+    "husky": "^9.1.7",
     "prisma": "6.4.1"
   },
   "peerDependencies": {
