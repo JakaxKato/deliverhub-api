@@ -186,12 +186,14 @@ projectRoutes.get("/:id/metrics", async (c) => {
     { total: number; completed: number; inProgress: number }
   > = {};
   for (const t of tasks) {
-    if (!departmentBreakdown[t.department]) {
-      departmentBreakdown[t.department] = { total: 0, completed: 0, inProgress: 0 };
+    let entry = departmentBreakdown[t.department];
+    if (!entry) {
+      entry = { total: 0, completed: 0, inProgress: 0 };
+      departmentBreakdown[t.department] = entry;
     }
-    departmentBreakdown[t.department].total += 1;
-    if (t.status === "DONE") departmentBreakdown[t.department].completed += 1;
-    if (t.status === "IN_PROGRESS") departmentBreakdown[t.department].inProgress += 1;
+    entry.total += 1;
+    if (t.status === "DONE") entry.completed += 1;
+    if (t.status === "IN_PROGRESS") entry.inProgress += 1;
   }
 
   return c.json({

@@ -203,9 +203,21 @@ auditRoutes.get("/standup-summary/:projectId", async (c) => {
   let markdown = `📋 **Daily Standup Summary: ${project.name} (${dateFormatted})**\n\n`;
 
   for (const dept of departments) {
-    const completed = completedByDept[dept];
-    const blocked = blockedByDept[dept];
-    const inProgress = inProgressByDept[dept];
+    completedByDept[dept] = completedYesterdayLogs
+      .filter((l) => l.task?.department === dept)
+      .map((l) => ({
+        taskCode: l.task?.taskCode,
+        title: l.task?.title,
+        completedBy: l.user.name,
+        timestamp: l.timestamp,
+      }));
+
+    blockedByDept[dept] = blockedToday.filter((t) => t.department === dept);
+    inProgressByDept[dept] = inProgressToday.filter((t) => t.department === dept);
+
+    const completed = completedByDept[dept] ?? [];
+    const blocked = blockedByDept[dept] ?? [];
+    const inProgress = inProgressByDept[dept] ?? [];
 
     if (completed.length === 0 && blocked.length === 0 && inProgress.length === 0) continue;
 

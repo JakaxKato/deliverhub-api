@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 
 const prisma = new PrismaClient();
 
-async function main() {
+export async function main() {
   console.log('🌱 Starting database seeding...');
 
   // Clean existing data
@@ -306,11 +306,13 @@ async function main() {
   console.log('🎉 Seeding successfully completed!');
 }
 
-main()
-  .catch((e) => {
-    console.error('❌ Seeding failed:', e);
-    process.exit(1);
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
-  });
+if (import.meta.main) {
+  main()
+    .catch((e) => {
+      console.error('❌ Seeding failed:', e);
+      process.exit(1);
+    })
+    .finally(async () => {
+      await prisma.$disconnect();
+    });
+}
