@@ -1,7 +1,10 @@
 import { z } from "zod";
 
 const envSchema = z.object({
-  PORT: z.string().default("4000").transform(Number),
+  PORT: z
+    .string()
+    .default("4000")
+    .transform((v) => Number(v) || 4000),
   DATABASE_URL: z.string(),
   JWT_SECRET: z.string().default("nodewave-super-secret-jwt-key-2026-production-grade"),
   JWT_EXPIRES_IN: z.string().default("7d"),

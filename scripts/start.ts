@@ -20,4 +20,15 @@ try {
   await prisma.$disconnect();
 }
 
-await import("../src/index");
+// Bun does not auto-serve the default export of an imported module, so the
+// HTTP server must be started explicitly here.
+const { app } = await import("../src/index");
+
+const port = Number(process.env.PORT) || 4000;
+
+Bun.serve({
+  port,
+  fetch: app.fetch,
+});
+
+console.log(`🚀 NodeWave Backend Engine listening on port ${port}`);
