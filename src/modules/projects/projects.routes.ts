@@ -1,4 +1,4 @@
-import { Role } from "@prisma/client";
+import { type Prisma, Role } from "@prisma/client";
 import { Hono } from "hono";
 import { z } from "zod";
 import { prisma } from "../../db/prisma";
@@ -27,7 +27,7 @@ projectRoutes.get("/", async (c) => {
   const baseQuery = buildPrismaQuery(filteringQuery);
 
   // Access control scoping:
-  const accessFilter: any = {
+  const accessFilter: Prisma.ProjectWhereInput = {
     deletedAt: null,
   };
 
@@ -153,7 +153,7 @@ projectRoutes.get("/:id/metrics", async (c) => {
   }
 
   // If Client, calculate metrics ONLY for client-visible tasks!
-  const taskWhere: any = {
+  const taskWhere: Prisma.TaskWhereInput = {
     projectId,
     deletedAt: null,
   };

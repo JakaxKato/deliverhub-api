@@ -1,10 +1,36 @@
-import { Department, Role, TaskStatus } from "@prisma/client";
+import { Department, type Prisma, Role, TaskStatus } from "@prisma/client";
 import { Hono } from "hono";
 import { prisma } from "../../db/prisma";
 import { authMiddleware } from "../../middlewares/auth.middleware";
 import { checkProjectAccess } from "../../middlewares/rbac.middleware";
 import { buildPrismaQuery, parseQueryParams } from "../../utils/ezfilter.helper";
 import { getTaskDependencyStatus } from "../tasks/tasks.routes";
+
+interface CompletedItem {
+  taskCode?: string;
+  title?: string;
+  completedBy: string;
+  timestamp: Date;
+}
+
+interface InProgressItem {
+  id: string;
+  taskCode: string;
+  title: string;
+  department: string;
+  assigneeName: string;
+}
+
+interface BlockedItem extends InProgressItem {
+  blockedReason: string;
+  pendingPrerequisites: {
+    id: string;
+    taskCode: string;
+    title: string;
+    status: string;
+    department: string;
+  }[];
+}
 
 const auditRoutes = new Hono();
 
@@ -29,7 +55,7 @@ auditRoutes.get("/", async (c) => {
   const filteringQuery = parseQueryParams(c);
   const baseQuery = buildPrismaQuery(filteringQuery);
 
-  const whereConditions: any[] = [];
+  const whereConditions: Prisma.AuditLogWhereInput[] = [];
   if (projectId) whereConditions.push({ projectId });
   if (taskId) whereConditions.push({ taskId });
   if (baseQuery.where) whereConditions.push(baseQuery.where);
@@ -144,8 +170,8 @@ auditRoutes.get("/standup-summary/:projectId", async (c) => {
     },
   });
 
-  const blockedToday: any[] = [];
-  const inProgressToday: any[] = [];
+  const blockedToday: BlockedItem[] = [];
+  const inProgressToday: InProgressItem[] = [];
 
   for (const t of allTasks) {
     if (t.status === TaskStatus.IN_PROGRESS) {
@@ -180,23 +206,9 @@ auditRoutes.get("/standup-summary/:projectId", async (c) => {
     Department.BACKEND,
   ];
 
-  const completedByDept: Record<string, any[]> = {};
-  const blockedByDept: Record<string, any[]> = {};
-  const inProgressByDept: Record<string, any[]> = {};
-
-  for (const dept of departments) {
-    completedByDept[dept] = completedYesterdayLogs
-      .filter((l) => l.task?.department === dept)
-      .map((l) => ({
-        taskCode: l.task?.taskCode,
-        title: l.task?.title,
-        completedBy: l.user.name,
-        timestamp: l.timestamp,
-      }));
-
-    blockedByDept[dept] = blockedToday.filter((t) => t.department === dept);
-    inProgressByDept[dept] = inProgressToday.filter((t) => t.department === dept);
-  }
+  const completedByDept: Record<string, CompletedItem[]> = {};
+  const blockedByDept: Record<string, BlockedItem[]> = {};
+  const inProgressByDept: Record<string, InProgressItem[]> = {};
 
   // Generate clean Markdown summary for Slack/Discord
   const dateFormatted = targetDate.toISOString().split("T")[0];

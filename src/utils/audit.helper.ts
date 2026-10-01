@@ -1,3 +1,4 @@
+import type { Prisma } from "@prisma/client";
 import { prisma } from "../db/prisma";
 
 export interface CreateAuditLogParams {
@@ -8,7 +9,7 @@ export interface CreateAuditLogParams {
   changedColumn?: string;
   oldValue?: string | null;
   newValue?: string | null;
-  metadata?: Record<string, unknown>;
+  metadata?: Prisma.InputJsonValue;
 }
 
 export async function recordAuditLog(params: CreateAuditLogParams) {
@@ -22,7 +23,7 @@ export async function recordAuditLog(params: CreateAuditLogParams) {
         changedColumn: params.changedColumn,
         oldValue: params.oldValue !== undefined ? String(params.oldValue) : null,
         newValue: params.newValue !== undefined ? String(params.newValue) : null,
-        metadata: (params.metadata as any) ?? undefined,
+        metadata: params.metadata ?? undefined,
       },
     });
   } catch (error) {

@@ -28,21 +28,22 @@ export async function wouldCreateCycle(
     if (!adj.has(dep.taskId)) {
       adj.set(dep.taskId, []);
     }
-    adj.get(dep.taskId)!.push(dep.prerequisiteTaskId);
+    adj.get(dep.taskId)?.push(dep.prerequisiteTaskId);
   }
 
   // Also add the prospective edge: downstreamTaskId -> upstreamTaskId
   if (!adj.has(downstreamTaskId)) {
     adj.set(downstreamTaskId, []);
   }
-  adj.get(downstreamTaskId)!.push(upstreamTaskId);
+  adj.get(downstreamTaskId)?.push(upstreamTaskId);
 
   // DFS to check if we can reach downstreamTaskId starting from upstreamTaskId
   const visited = new Set<string>();
   const stack = [upstreamTaskId];
 
   while (stack.length > 0) {
-    const current = stack.pop()!;
+    const current = stack.pop();
+    if (!current) break;
     if (current === downstreamTaskId) {
       return true; // Cycle detected!
     }

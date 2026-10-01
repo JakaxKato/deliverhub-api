@@ -1,41 +1,40 @@
-import { BuildQueryFilter, type FilteringQuery } from "@nodewave/prisma-ezfilter";
+import {
+  BuildQueryFilter,
+  type FilteringQuery,
+  type RangedFilter,
+} from "@nodewave/prisma-ezfilter";
 import type { Context } from "hono";
+
+type EzFilterMap = Record<string, unknown | unknown[] | null>;
+
+function parseJsonField(raw: string | undefined): unknown {
+  if (!raw) return undefined;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+}
 
 export function parseQueryParams(c: Context): FilteringQuery {
   const query = c.req.query();
 
-  let filters: Record<string, any> | undefined;
-  if (query.filters) {
-    try {
-      filters = typeof query.filters === "string" ? JSON.parse(query.filters) : query.filters;
-    } catch {
-      filters = undefined;
-    }
-  }
+  const parsedFilters = parseJsonField(query.filters);
+  const filters: EzFilterMap | undefined =
+    parsedFilters !== undefined && typeof parsedFilters === "object"
+      ? (parsedFilters as EzFilterMap)
+      : undefined;
 
-  let searchFilters: Record<string, any> | undefined;
-  if (query.searchFilters) {
-    try {
-      searchFilters =
-        typeof query.searchFilters === "string"
-          ? JSON.parse(query.searchFilters)
-          : query.searchFilters;
-    } catch {
-      searchFilters = undefined;
-    }
-  }
+  const parsedSearch = parseJsonField(query.searchFilters);
+  const searchFilters: EzFilterMap | undefined =
+    parsedSearch !== undefined && typeof parsedSearch === "object"
+      ? (parsedSearch as EzFilterMap)
+      : undefined;
 
-  let rangedFilters: any[] | undefined;
-  if (query.rangedFilters) {
-    try {
-      rangedFilters =
-        typeof query.rangedFilters === "string"
-          ? JSON.parse(query.rangedFilters)
-          : query.rangedFilters;
-    } catch {
-      rangedFilters = undefined;
-    }
-  }
+  const parsedRanged = parseJsonField(query.rangedFilters);
+  const rangedFilters: RangedFilter[] | undefined = Array.isArray(parsedRanged)
+    ? (parsedRanged as RangedFilter[])
+    : undefined;
 
   const page = query.page ? Math.max(1, parseInt(query.page, 10)) : 1;
   const rows = query.rows ? Math.min(100, Math.max(1, parseInt(query.rows, 10))) : 20;

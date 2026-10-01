@@ -1,4 +1,4 @@
-import { Department, Priority, Role, TaskStatus } from "@prisma/client";
+import { Department, Priority, type Prisma, Role, TaskStatus } from "@prisma/client";
 import { Hono } from "hono";
 import { z } from "zod";
 import { prisma } from "../../db/prisma";
@@ -49,8 +49,48 @@ export async function getTaskDependencyStatus(taskId: string) {
 
 /**
  * Masks internal identities and comments for Client Guest users.
+ * Only a whitelist of safe fields is returned — identities, departments,
+ * and internal audit trails are stripped at the API level.
  */
-function maskTaskForClient(task: any) {
+interface MaskableAttachment {
+  id: string;
+  fileName: string;
+  fileUrl: string;
+  fileType: string | null;
+  createdAt: Date;
+}
+
+interface MaskableDependency {
+  prerequisiteTask: {
+    id: string;
+    taskCode: string;
+    title: string;
+    status: string;
+  } | null;
+}
+
+interface MaskableTask {
+  id: string;
+  taskCode: string;
+  projectId: string;
+  title: string;
+  description: string | null;
+  status: string;
+  priority: string;
+  isClientVisible: boolean;
+  dueDate: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+  version: number;
+  assignee: { name: string } | null;
+  attachments: MaskableAttachment[];
+  dependencies: MaskableDependency[];
+  isBlocked: boolean;
+  blockedReason: string | null;
+  pendingPrerequisites: { id: string; taskCode: string; title: string; status: string }[];
+}
+
+function maskTaskForClient(task: MaskableTask) {
   return {
     id: task.id,
     taskCode: task.taskCode,
@@ -68,14 +108,14 @@ function maskTaskForClient(task: any) {
     department: undefined,
     assignee: task.assignee ? { name: "Assigned Specialist" } : null,
     creator: { name: "NodeWave Team" },
-    attachments: (task.attachments || []).map((att: any) => ({
+    attachments: (task.attachments || []).map((att: MaskableAttachment) => ({
       id: att.id,
       fileName: att.fileName,
       fileUrl: att.fileUrl,
       fileType: att.fileType,
       createdAt: att.createdAt,
     })),
-    dependencies: (task.dependencies || []).map((dep: any) => ({
+    dependencies: (task.dependencies || []).map((dep: MaskableDependency) => ({
       id: dep.prerequisiteTask?.id,
       taskCode: dep.prerequisiteTask?.taskCode,
       title: dep.prerequisiteTask?.title,
@@ -96,7 +136,7 @@ taskRoutes.get("/", async (c) => {
   const filteringQuery = parseQueryParams(c);
   const baseQuery = buildPrismaQuery(filteringQuery);
 
-  const whereConditions: any[] = [{ deletedAt: null }];
+  const whereConditions: Prisma.TaskWhereInput[] = [{ deletedAt: null }];
 
   if (projectId) {
     const hasAccess = await checkProjectAccess(user.userId, user.role, projectId);
@@ -449,7 +489,7 @@ taskRoutes.put("/:id", requireRole(Role.PM), async (c) => {
     );
   }
 
-  const updatePayload: any = {
+  const updatePayload: Prisma.TaskUncheckedUpdateInput = {
     version: { increment: 1 },
   };
 

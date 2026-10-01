@@ -7,7 +7,7 @@ import type { JwtPayload } from "../types";
 export const authMiddleware: MiddlewareHandler = async (c, next) => {
   const authHeader = c.req.header("Authorization");
 
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+  if (!authHeader?.startsWith("Bearer ")) {
     return c.json(
       {
         success: false,
@@ -51,13 +51,13 @@ export const authMiddleware: MiddlewareHandler = async (c, next) => {
     });
 
     await next();
-  } catch (err: any) {
+  } catch (err) {
     return c.json(
       {
         success: false,
         error: "Unauthorized",
         message: "Invalid or expired token.",
-        details: err.message,
+        details: err instanceof Error ? err.message : String(err),
       },
       401,
     );
