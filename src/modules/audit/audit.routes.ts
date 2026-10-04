@@ -1,8 +1,14 @@
 import { Department, type Prisma, Role, TaskStatus } from "@prisma/client";
 import { Hono } from "hono";
+import { HTTPException } from "hono/http-exception";
 import { prisma } from "../../db/prisma";
 import { authMiddleware } from "../../middlewares/auth.middleware";
-import { checkProjectAccess } from "../../middlewares/rbac.middleware";
+import {
+  projectAccessWhere,
+  requireProject,
+  requireTask,
+  taskAccessWhere,
+} from "../../utils/authorization.helper";
 import { buildPrismaQuery, parseQueryParams } from "../../utils/ezfilter.helper";
 import { getTaskDependencyStatus } from "../tasks/tasks.routes";
 
@@ -39,7 +45,7 @@ auditRoutes.use("*", authMiddleware);
 // List Audit Logs
 auditRoutes.get("/", async (c) => {
   const user = c.get("user");
-  if (user.role === Role.CLIENT) {
+  if (user.role !== Role.PM && user.role !== Role.MEMBER) {
     return c.json(
       {
         success: false,
@@ -52,22 +58,31 @@ auditRoutes.get("/", async (c) => {
 
   const projectId = c.req.query("projectId");
   const taskId = c.req.query("taskId");
-  const filteringQuery = parseQueryParams(c);
+  const filteringQuery = parseQueryParams(c, "audit");
   const baseQuery = buildPrismaQuery(filteringQuery);
 
-  const whereConditions: Prisma.AuditLogWhereInput[] = [];
+  for (const id of new Set([projectId, filteringQuery.filters?.projectId])) {
+    if (typeof id === "string") await requireProject(prisma, user, id);
+  }
+  for (const id of new Set([taskId, filteringQuery.filters?.taskId])) {
+    if (typeof id === "string") await requireTask(prisma, user, id);
+  }
+
+  const whereConditions: Prisma.AuditLogWhereInput[] = [
+    { project: { is: projectAccessWhere(user) } },
+  ];
   if (projectId) whereConditions.push({ projectId });
   if (taskId) whereConditions.push({ taskId });
   if (baseQuery.where) whereConditions.push(baseQuery.where);
 
-  const where = whereConditions.length > 0 ? { AND: whereConditions } : {};
+  const where: Prisma.AuditLogWhereInput = { AND: whereConditions };
 
   const [logs, total] = await Promise.all([
     prisma.auditLog.findMany({
       where,
-      orderBy: { timestamp: "desc" },
+      orderBy: baseQuery.orderBy as Prisma.AuditLogOrderByWithRelationInput[],
       skip: baseQuery.skip,
-      take: baseQuery.take || 25,
+      take: baseQuery.take,
       include: {
         user: {
           select: { id: true, name: true, role: true, department: true, avatarUrl: true },
@@ -87,7 +102,7 @@ auditRoutes.get("/", async (c) => {
       page: filteringQuery.page,
       rows: filteringQuery.rows,
       total,
-      totalPages: Math.ceil(total / (filteringQuery.rows || 25)),
+      totalPages: Math.ceil(total / filteringQuery.rows),
     },
   });
 });
@@ -97,7 +112,7 @@ auditRoutes.get("/standup-summary/:projectId", async (c) => {
   const user = c.get("user");
   const projectId = c.req.param("projectId");
 
-  if (user.role === Role.CLIENT) {
+  if (user.role !== Role.PM && user.role !== Role.MEMBER) {
     return c.json(
       {
         success: false,
@@ -108,45 +123,44 @@ auditRoutes.get("/standup-summary/:projectId", async (c) => {
     );
   }
 
-  const hasAccess = await checkProjectAccess(user.userId, user.role, projectId);
-  if (!hasAccess) {
-    return c.json(
-      { success: false, error: "Forbidden", message: "Access denied to this project." },
-      403,
-    );
-  }
+  const project = await requireProject(prisma, user, projectId);
 
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
-  });
-
-  if (!project) {
-    return c.json({ success: false, error: "Not Found", message: "Project not found." }, 404);
-  }
-
-  // Calculate target date (defaults to yesterday, or custom ?date=YYYY-MM-DD)
+  // A date denotes one complete UTC day, regardless of the server timezone.
   const dateParam = c.req.query("date");
   let targetDate: Date;
-  if (dateParam) {
-    targetDate = new Date(dateParam);
+  if (dateParam !== undefined) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateParam)) {
+      throw new HTTPException(400, {
+        message: "date must be a valid UTC date in YYYY-MM-DD format.",
+      });
+    }
+    targetDate = new Date(`${dateParam}T00:00:00.000Z`);
+    if (
+      !Number.isFinite(targetDate.getTime()) ||
+      targetDate.toISOString().slice(0, 10) !== dateParam
+    ) {
+      throw new HTTPException(400, {
+        message: "date must be a valid UTC date in YYYY-MM-DD format.",
+      });
+    }
   } else {
     targetDate = new Date();
-    targetDate.setDate(targetDate.getDate() - 1);
+    targetDate.setUTCHours(0, 0, 0, 0);
+    targetDate.setUTCDate(targetDate.getUTCDate() - 1);
   }
 
-  const startOfDay = new Date(targetDate);
-  startOfDay.setHours(0, 0, 0, 0);
-
-  const endOfDay = new Date(targetDate);
-  endOfDay.setHours(23, 59, 59, 999);
+  const startOfDay = targetDate;
+  const endOfDay = new Date(startOfDay);
+  endOfDay.setUTCDate(endOfDay.getUTCDate() + 1);
 
   // 1. Audit trail entries for target day where status changed to DONE
   const completedYesterdayLogs = await prisma.auditLog.findMany({
     where: {
       projectId,
+      task: { is: { AND: [{ projectId }, taskAccessWhere(user)] } },
       timestamp: {
         gte: startOfDay,
-        lte: endOfDay,
+        lt: endOfDay,
       },
       action: "STATUS_CHANGED",
       changedColumn: "status",
@@ -164,7 +178,7 @@ auditRoutes.get("/standup-summary/:projectId", async (c) => {
 
   // 2. Current tasks that are currently BLOCKED
   const allTasks = await prisma.task.findMany({
-    where: { projectId, deletedAt: null },
+    where: { AND: [{ projectId }, taskAccessWhere(user)] },
     include: {
       assignee: { select: { id: true, name: true } },
     },

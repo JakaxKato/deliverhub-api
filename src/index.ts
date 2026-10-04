@@ -6,6 +6,7 @@ import { env } from "./config/env";
 import { errorHandler } from "./middlewares/error.middleware";
 import { auditRoutes } from "./modules/audit/audit.routes";
 import { authRoutes } from "./modules/auth/auth.routes";
+import { commentRoutes } from "./modules/comments/comments.routes";
 import { projectRoutes } from "./modules/projects/projects.routes";
 import { taskRoutes } from "./modules/tasks/tasks.routes";
 
@@ -17,15 +18,12 @@ app.use("*", prettyJSON());
 app.use(
   "*",
   cors({
-    origin: (origin) => {
-      // Allow localhost and any production domain
-      return origin || "*";
-    },
+    origin: (origin) => (env.CORS_ORIGINS.includes(origin) ? origin : ""),
     allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
     exposeHeaders: ["Content-Length", "X-Kuma-Revision"],
     maxAge: 600,
-    credentials: true,
+    credentials: false,
   }),
 );
 
@@ -44,6 +42,7 @@ app.get("/health", (c) => {
 app.route("/api/auth", authRoutes);
 app.route("/api/projects", projectRoutes);
 app.route("/api/tasks", taskRoutes);
+app.route("/api/comments", commentRoutes);
 app.route("/api/audit", auditRoutes);
 
 // Global Error Handler

@@ -1,34 +1,15 @@
-import { execSync } from "node:child_process";
-import { PrismaClient } from "@prisma/client";
+import { execFileSync } from "node:child_process";
+import { env } from "../src/config/env";
 
-const prisma = new PrismaClient();
-
+// Validate configuration before any migration or database side effect.
 try {
-  execSync("bunx prisma migrate deploy", { stdio: "inherit" });
-} catch (err) {
-  console.error("❌ Migration failed:", err);
+  execFileSync(process.execPath, ["run", "db:migrate"], { stdio: "inherit" });
+} catch (error) {
+  console.error("Database migration failed; refusing to start:", error);
   process.exit(1);
 }
 
-try {
-  const userCount = await prisma.user.count();
-  if (userCount === 0) {
-    console.log("🌱 Database is empty, running canonical seed...");
-    execSync("bun prisma/seed.ts", { stdio: "inherit" });
-  }
-} finally {
-  await prisma.$disconnect();
-}
-
-// Bun does not auto-serve the default export of an imported module, so the
-// HTTP server must be started explicitly here.
+// Seeding is a separate, explicit operator action in every environment.
 const { app } = await import("../src/index");
-
-const port = Number(process.env.PORT) || 4000;
-
-Bun.serve({
-  port,
-  fetch: app.fetch,
-});
-
-console.log(`🚀 NodeWave Backend Engine listening on port ${port}`);
+Bun.serve({ port: env.PORT, fetch: app.fetch });
+console.log(`NodeWave Backend Engine listening on port ${env.PORT}`);

@@ -1,1051 +1,912 @@
-import { Department, Priority, type Prisma, Role, TaskStatus } from "@prisma/client";
+import { Department, Priority, Prisma, Role, type Task, TaskStatus } from "@prisma/client";
+import type { Context, MiddlewareHandler } from "hono";
 import { Hono } from "hono";
+import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
 import { prisma } from "../../db/prisma";
 import { authMiddleware } from "../../middlewares/auth.middleware";
-import { checkProjectAccess, requireRole } from "../../middlewares/rbac.middleware";
+import { errorHandler } from "../../middlewares/error.middleware";
+import { requireRole } from "../../middlewares/rbac.middleware";
+import type { AuthUser } from "../../types";
 import { recordAuditLog } from "../../utils/audit.helper";
+import {
+  assertActiveActor,
+  requireInternal,
+  requireProject,
+  requireTask,
+  taskAccessWhere,
+  taskPermissions,
+  validateTaskAssignee,
+} from "../../utils/authorization.helper";
 import { wouldCreateCycle } from "../../utils/cycle-detector";
 import { buildPrismaQuery, parseQueryParams } from "../../utils/ezfilter.helper";
+import { withProjectTransaction } from "../../utils/transaction.helper";
 
 const taskRoutes = new Hono();
-
 taskRoutes.use("*", authMiddleware);
+const versionSchema = z.number().int().min(1).max(2147483647);
+const versionBody = z.object({ version: versionSchema }).strict();
+const departmentSchema = z.enum([Department.UIUX, Department.FRONTEND, Department.BACKEND]);
+const requireTaskManager: MiddlewareHandler = async (c, next) => {
+  await requireTask(prisma, c.get("user"), c.req.param("id") ?? "");
+  if (c.get("user").role !== Role.PM)
+    throw new HTTPException(403, {
+      message: "Only project managers may manage task details and dependencies.",
+    });
+  await next();
+};
 
-/**
- * Checks if a task is blocked by incomplete prerequisites.
- */
-export async function getTaskDependencyStatus(taskId: string) {
-  const dependencies = await prisma.taskDependency.findMany({
-    where: { taskId },
+const taskInclude = {
+  project: { select: { id: true, name: true, key: true } },
+  assignee: { select: { id: true, name: true, email: true, department: true, avatarUrl: true } },
+  creator: { select: { id: true, name: true, email: true, department: true } },
+  dependencies: {
+    where: { deletedAt: null, prerequisiteTask: { deletedAt: null, project: { deletedAt: null } } },
+    include: { prerequisiteTask: true },
+  },
+  dependents: {
+    where: { deletedAt: null, task: { deletedAt: null, project: { deletedAt: null } } },
+    include: {
+      task: { select: { id: true, taskCode: true, title: true, status: true, department: true } },
+    },
+  },
+  attachments: {
+    where: { deletedAt: null },
+    include: { uploader: { select: { id: true, name: true } } },
+  },
+} satisfies Prisma.TaskInclude;
+type LoadedTask = Prisma.TaskGetPayload<{ include: typeof taskInclude }>;
+
+function prerequisiteDto(task: Task) {
+  return { id: task.id, taskCode: task.taskCode, title: task.title, status: task.status };
+}
+
+function taskDto(task: LoadedTask, user: AuthUser) {
+  const pending = task.dependencies
+    .map((edge) => edge.prerequisiteTask)
+    .filter((p) => p.status !== TaskStatus.DONE);
+  const isBlocked = pending.length > 0;
+  if (user.role === Role.CLIENT) {
+    const visible = task.dependencies
+      .map((edge) => edge.prerequisiteTask)
+      .filter((p) => p.projectId === task.projectId && p.isClientVisible);
+    const hiddenBlocker = pending.some((p) => p.projectId !== task.projectId || !p.isClientVisible);
+    return {
+      id: task.id,
+      taskCode: task.taskCode,
+      projectId: task.projectId,
+      title: task.title,
+      description: task.description,
+      status: task.status,
+      priority: task.priority,
+      isClientVisible: task.isClientVisible,
+      dueDate: task.dueDate,
+      createdAt: task.createdAt,
+      updatedAt: task.updatedAt,
+      attachments: task.attachments.map((attachment) => ({
+        id: attachment.id,
+        fileName: attachment.fileName,
+        fileUrl: attachment.fileUrl,
+        fileType: attachment.fileType,
+        fileSize: attachment.fileSize,
+        createdAt: attachment.createdAt,
+      })),
+      dependencies: visible.map(prerequisiteDto),
+      isBlocked,
+      blockedReason: isBlocked
+        ? hiddenBlocker
+          ? "Blocked by an incomplete prerequisite."
+          : "Awaiting completion of visible prerequisites."
+        : null,
+      pendingPrerequisites: visible
+        .filter((p) => p.status !== TaskStatus.DONE)
+        .map(prerequisiteDto),
+    };
+  }
+  const internalPending = pending
+    .filter((p) => p.projectId === task.projectId)
+    .map((p) => ({ ...prerequisiteDto(p), department: p.department }));
+  return {
+    ...task,
+    dependencies: task.dependencies
+      .filter((edge) => edge.prerequisiteTask.projectId === task.projectId)
+      .map((edge) => ({
+        id: edge.id,
+        taskId: edge.taskId,
+        prerequisiteTaskId: edge.prerequisiteTaskId,
+        createdAt: edge.createdAt,
+        prerequisiteTask: {
+          ...prerequisiteDto(edge.prerequisiteTask),
+          department: edge.prerequisiteTask.department,
+        },
+      })),
+    isBlocked,
+    pendingPrerequisites: internalPending,
+    blockedReason: isBlocked
+      ? `Blocked by: ${internalPending.map((p) => `${p.taskCode} (${p.title})`).join(", ") || "an incomplete prerequisite"}`
+      : null,
+    permissions: taskPermissions(user, task, isBlocked),
+  };
+}
+
+async function loadTaskDto(db: Prisma.TransactionClient, user: AuthUser, taskId: string) {
+  const task = await db.task.findFirst({
+    where: { AND: [{ id: taskId }, taskAccessWhere(user)] },
+    include: taskInclude,
+  });
+  if (!task) throw new HTTPException(404, { message: "Task not found." });
+  return taskDto(task, user);
+}
+
+export async function getTaskDependencyStatus(
+  taskId: string,
+  db: Prisma.TransactionClient = prisma,
+) {
+  const task = await db.task.findFirst({
+    where: { id: taskId, deletedAt: null, project: { deletedAt: null } },
+  });
+  if (!task) throw new HTTPException(404, { message: "Task not found." });
+  const edges = await db.taskDependency.findMany({
+    where: {
+      taskId,
+      deletedAt: null,
+      prerequisiteTask: {
+        deletedAt: null,
+        projectId: task.projectId,
+        project: { deletedAt: null },
+      },
+    },
     include: {
       prerequisiteTask: {
-        select: {
-          id: true,
-          taskCode: true,
-          title: true,
-          status: true,
-          department: true,
-        },
+        select: { id: true, taskCode: true, title: true, status: true, department: true },
       },
     },
   });
-
-  const pendingPrerequisites = dependencies
-    .map((d) => d.prerequisiteTask)
-    .filter((p) => p.status !== TaskStatus.DONE);
-
-  const isBlocked = pendingPrerequisites.length > 0;
-
+  const dependencies = edges.map((edge) => edge.prerequisiteTask);
+  const pendingPrerequisites = dependencies.filter((p) => p.status !== TaskStatus.DONE);
   return {
-    dependencies: dependencies.map((d) => d.prerequisiteTask),
+    dependencies,
     pendingPrerequisites,
-    isBlocked,
-    blockedReason: isBlocked
+    isBlocked: pendingPrerequisites.length > 0,
+    blockedReason: pendingPrerequisites.length
       ? `Blocked by: ${pendingPrerequisites.map((p) => `${p.taskCode} (${p.title})`).join(", ")}`
       : null,
   };
 }
 
-/**
- * Masks internal identities and comments for Client Guest users.
- * Only a whitelist of safe fields is returned — identities, departments,
- * and internal audit trails are stripped at the API level.
- */
-interface MaskableAttachment {
-  id: string;
-  fileName: string;
-  fileUrl: string;
-  fileType: string | null;
-  createdAt: Date;
+class TaskConflict extends Error {
+  constructor(
+    readonly taskId: string,
+    readonly clientVersion: number,
+    message = "This task was modified concurrently. Reload and review the latest version.",
+  ) {
+    super(message);
+  }
 }
 
-interface MaskableDependency {
-  prerequisiteTask: {
-    id: string;
-    taskCode: string;
-    title: string;
-    status: string;
-  } | null;
-}
-
-interface MaskableTask {
-  id: string;
-  taskCode: string;
-  projectId: string;
-  title: string;
-  description: string | null;
-  status: string;
-  priority: string;
-  isClientVisible: boolean;
-  dueDate: Date | null;
-  createdAt: Date;
-  updatedAt: Date;
-  version: number;
-  assignee: { name: string } | null;
-  attachments: MaskableAttachment[];
-  dependencies: MaskableDependency[];
-  isBlocked: boolean;
-  blockedReason: string | null;
-  pendingPrerequisites: { id: string; taskCode: string; title: string; status: string }[];
-}
-
-function maskTaskForClient(task: MaskableTask) {
-  return {
-    id: task.id,
-    taskCode: task.taskCode,
-    projectId: task.projectId,
-    title: task.title,
-    description: task.description,
-    status: task.status,
-    priority: task.priority,
-    isClientVisible: task.isClientVisible,
-    dueDate: task.dueDate,
-    createdAt: task.createdAt,
-    updatedAt: task.updatedAt,
-    version: task.version,
-    // Strictly masked identities:
-    department: undefined,
-    assignee: task.assignee ? { name: "Assigned Specialist" } : null,
-    creator: { name: "NodeWave Team" },
-    attachments: (task.attachments || []).map((att: MaskableAttachment) => ({
-      id: att.id,
-      fileName: att.fileName,
-      fileUrl: att.fileUrl,
-      fileType: att.fileType,
-      createdAt: att.createdAt,
-    })),
-    dependencies: (task.dependencies || []).map((dep: MaskableDependency) => ({
-      id: dep.prerequisiteTask?.id,
-      taskCode: dep.prerequisiteTask?.taskCode,
-      title: dep.prerequisiteTask?.title,
-      status: dep.prerequisiteTask?.status,
-    })),
-    // Internal audit trail omitted for client!
-    auditLogs: [],
-    isBlocked: task.isBlocked,
-    blockedReason: task.blockedReason,
-    pendingPrerequisites: task.pendingPrerequisites,
-  };
-}
-
-// 1. List Tasks (ezfilter support, search, range, status filter, masking)
-taskRoutes.get("/", async (c) => {
-  const user = c.get("user");
-  const projectId = c.req.query("projectId");
-  const filteringQuery = parseQueryParams(c);
-  const baseQuery = buildPrismaQuery(filteringQuery);
-
-  const whereConditions: Prisma.TaskWhereInput[] = [{ deletedAt: null }];
-
-  if (projectId) {
-    const hasAccess = await checkProjectAccess(user.userId, user.role, projectId);
-    if (!hasAccess) {
+taskRoutes.onError(async (error, c) => {
+  if (error instanceof TaskConflict) {
+    try {
+      const latestData = await loadTaskDto(prisma, c.get("user"), error.taskId);
+      if (!("version" in latestData))
+        throw new HTTPException(403, { message: "Clients are read-only." });
       return c.json(
-        { success: false, error: "Forbidden", message: "You do not have access to this project." },
-        403,
+        {
+          success: false,
+          error: "Conflict",
+          message: error.message,
+          latestData,
+          serverVersion: latestData.version,
+          clientVersion: error.clientVersion,
+        },
+        409,
+      );
+    } catch (lookupError) {
+      return errorHandler(
+        lookupError instanceof Error ? lookupError : new Error("Snapshot unavailable"),
+        c,
       );
     }
-    whereConditions.push({ projectId });
-  } else {
-    // If no specific projectId passed, filter accessible projects
-    if (user.role === Role.CLIENT) {
-      whereConditions.push({
-        project: { clientId: user.userId, deletedAt: null },
-      });
-    } else if (user.role === Role.MEMBER) {
-      whereConditions.push({
-        project: {
-          members: { some: { userId: user.userId } },
-          deletedAt: null,
-        },
-      });
+  }
+  if (
+    error instanceof HTTPException &&
+    error.status === 422 &&
+    error.message.startsWith("TaskBlocked:")
+  ) {
+    return c.json({ success: false, error: "TaskBlocked", message: error.message }, 422);
+  }
+  if (
+    error instanceof HTTPException &&
+    error.status === 400 &&
+    error.message.startsWith("Circular dependency")
+  ) {
+    return c.json({ success: false, error: "CircularDependency", message: error.message }, 400);
+  }
+  return errorHandler(error, c);
+});
+
+function checkVersion(task: Task, version: number) {
+  if (task.version !== version) throw new TaskConflict(task.id, version);
+}
+
+async function bumpTask(
+  tx: Prisma.TransactionClient,
+  user: AuthUser,
+  task: Task,
+  version: number,
+  data: Prisma.TaskUpdateManyMutationInput = {},
+) {
+  const result = await tx.task.updateMany({
+    where: { AND: [{ id: task.id, version }, taskAccessWhere(user)] },
+    data: { ...data, version: { increment: 1 } },
+  });
+  if (result.count !== 1) throw new TaskConflict(task.id, version);
+}
+
+async function taskMutation<T>(
+  user: AuthUser,
+  taskId: string,
+  version: number,
+  work: (tx: Prisma.TransactionClient, task: Task) => Promise<T>,
+) {
+  const resolved = await requireTask(prisma, user, taskId);
+  try {
+    return await withProjectTransaction(resolved.projectId, async (tx) => {
+      await assertActiveActor(tx, user);
+      const task = await requireTask(tx, user, taskId);
+      checkVersion(task, version);
+      return work(tx, task);
+    });
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034")
+      throw new TaskConflict(
+        taskId,
+        version,
+        "Concurrent mutation could not be committed. Reload before retrying.",
+      );
+    throw error;
+  }
+}
+
+async function mutationBody<T>(c: Context, schema: z.ZodType<T>) {
+  await requireTask(prisma, c.get("user"), c.req.param("id") ?? "");
+  requireInternal(c.get("user"));
+  // Resource resolution intentionally precedes payload validation, so deleted or
+  // inaccessible tasks cannot become an input-validation/existence oracle.
+  const body: unknown = await c.req.json().catch(() => {
+    throw new HTTPException(400, { message: "A valid JSON mutation body is required." });
+  });
+  return schema.parse(body);
+}
+
+async function statusAudit(
+  tx: Prisma.TransactionClient,
+  user: AuthUser,
+  task: Task,
+  next: TaskStatus,
+  action: string,
+) {
+  await recordAuditLog(
+    {
+      projectId: task.projectId,
+      taskId: task.id,
+      userId: user.userId,
+      action,
+      changedColumn: "status",
+      oldValue: task.status,
+      newValue: next,
+    },
+    tx,
+  );
+}
+
+// Recompute in topological order, so diamond graphs block/unblock each affected
+// task once. Project locking prevents concurrent graph edits and auto-transitions.
+async function syncProjectBlocking(
+  tx: Prisma.TransactionClient,
+  user: AuthUser,
+  projectId: string,
+  sourceIds: string[],
+  includeSources = false,
+) {
+  const tasks = await tx.task.findMany({ where: { projectId, deletedAt: null } });
+  const edges = await tx.taskDependency.findMany({
+    where: {
+      deletedAt: null,
+      task: { projectId, deletedAt: null },
+      prerequisiteTask: { projectId, deletedAt: null },
+    },
+  });
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  const prerequisites = new Map<string, string[]>();
+  const affected = new Set<string>(includeSources ? sourceIds : []);
+  const queue = [...sourceIds];
+  const sources = new Set(sourceIds);
+  while (queue.length) {
+    const source = queue.shift();
+    for (const edge of edges) {
+      if (edge.prerequisiteTaskId !== source || affected.has(edge.taskId)) continue;
+      affected.add(edge.taskId);
+      queue.push(edge.taskId);
     }
   }
-
-  // Client isolation: Client can ONLY see client-visible tasks!
-  if (user.role === Role.CLIENT) {
-    whereConditions.push({ isClientVisible: true });
+  if (!includeSources) for (const id of sources) affected.delete(id);
+  for (const edge of edges) {
+    const ids = prerequisites.get(edge.taskId) ?? [];
+    ids.push(edge.prerequisiteTaskId);
+    prerequisites.set(edge.taskId, ids);
   }
-
-  // Add ezfilter conditions
-  if (baseQuery.where) {
-    whereConditions.push(baseQuery.where);
+  const visited = new Set<string>();
+  const visiting = new Set<string>();
+  const ordered: Task[] = [];
+  function visit(task: Task) {
+    if (visited.has(task.id)) return;
+    if (visiting.has(task.id))
+      throw new HTTPException(400, { message: "Dependency graph contains a cycle." });
+    visiting.add(task.id);
+    for (const id of prerequisites.get(task.id) ?? []) {
+      const prerequisite = byId.get(id);
+      if (prerequisite) visit(prerequisite);
+    }
+    visiting.delete(task.id);
+    visited.add(task.id);
+    ordered.push(task);
   }
+  for (const task of tasks) visit(task);
+  for (const task of ordered) {
+    if (!affected.has(task.id)) continue;
+    const blocked = (prerequisites.get(task.id) ?? []).some(
+      (id) => byId.get(id)?.status !== TaskStatus.DONE,
+    );
+    const next = blocked
+      ? TaskStatus.BLOCKED
+      : task.status === TaskStatus.BLOCKED
+        ? TaskStatus.TODO
+        : task.status;
+    if (next === task.status) continue;
+    await bumpTask(tx, user, task, task.version, { status: next });
+    await statusAudit(tx, user, task, next, blocked ? "AUTO_BLOCKED" : "AUTO_UNBLOCKED");
+    task.status = next;
+    task.version += 1;
+  }
+}
 
-  const where = { AND: whereConditions };
+async function requirePrerequisite(
+  tx: Prisma.TransactionClient,
+  task: Task,
+  prerequisiteId: string,
+) {
+  if (task.id === prerequisiteId)
+    throw new HTTPException(400, { message: "A task cannot depend on itself." });
+  const prerequisite = await tx.task.findFirst({
+    where: { id: prerequisiteId, deletedAt: null, project: { deletedAt: null } },
+  });
+  if (!prerequisite) throw new HTTPException(404, { message: "Prerequisite not found." });
+  if (prerequisite.projectId !== task.projectId)
+    throw new HTTPException(400, { message: "Prerequisites must belong to the same project." });
+  return prerequisite;
+}
 
+function auditValue(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  return value instanceof Date ? value.toISOString() : String(value);
+}
+
+taskRoutes.get("/", async (c) => {
+  const user = c.get("user");
+  const query = parseQueryParams(c, user.role === Role.CLIENT ? "clientTasks" : "tasks");
+  const plan = buildPrismaQuery(query);
+  const projectId = c.req.query("projectId");
+  if (projectId) await requireProject(prisma, user, projectId);
+  const where: Prisma.TaskWhereInput = {
+    AND: [taskAccessWhere(user), projectId ? { projectId } : {}, plan.where ?? {}],
+  };
   const [tasks, total] = await Promise.all([
     prisma.task.findMany({
       where,
-      orderBy:
-        baseQuery.orderBy && Object.keys(baseQuery.orderBy).length > 0
-          ? baseQuery.orderBy
-          : { createdAt: "desc" },
-      skip: baseQuery.skip,
-      take: baseQuery.take,
-      include: {
-        project: {
-          select: { id: true, name: true, key: true },
-        },
-        assignee: {
-          select: { id: true, name: true, email: true, department: true, avatarUrl: true },
-        },
-        creator: {
-          select: { id: true, name: true, email: true, department: true },
-        },
-        dependencies: {
-          include: {
-            prerequisiteTask: {
-              select: { id: true, taskCode: true, title: true, status: true, department: true },
-            },
-          },
-        },
-        dependents: {
-          include: {
-            task: {
-              select: { id: true, taskCode: true, title: true, status: true, department: true },
-            },
-          },
-        },
-        attachments: {
-          where: { deletedAt: null },
-          include: {
-            uploader: {
-              select: { id: true, name: true },
-            },
-          },
-        },
-      },
+      orderBy: plan.orderBy as Prisma.TaskOrderByWithRelationInput[],
+      skip: plan.skip,
+      take: plan.take,
+      include: taskInclude,
     }),
     prisma.task.count({ where }),
   ]);
-
-  // Compute dynamic blocked status for each task
-  const enrichedTasks = tasks.map((task) => {
-    const pendingPrerequisites = task.dependencies
-      .map((d) => d.prerequisiteTask)
-      .filter((p) => p.status !== TaskStatus.DONE);
-
-    const isBlocked = pendingPrerequisites.length > 0;
-    const blockedReason = isBlocked
-      ? `Blocked by: ${pendingPrerequisites.map((p) => `${p.taskCode} (${p.title})`).join(", ")}`
-      : null;
-
-    const enriched = {
-      ...task,
-      isBlocked,
-      pendingPrerequisites,
-      blockedReason,
-    };
-
-    if (user.role === Role.CLIENT) {
-      return maskTaskForClient(enriched);
-    }
-
-    return enriched;
-  });
-
   return c.json({
     success: true,
-    data: enrichedTasks,
-    meta: {
-      page: filteringQuery.page,
-      rows: filteringQuery.rows,
-      total,
-      totalPages: Math.ceil(total / (filteringQuery.rows || 20)),
-    },
+    data: tasks.map((task) => taskDto(task, user)),
+    meta: { page: query.page, rows: query.rows, total, totalPages: Math.ceil(total / query.rows) },
   });
 });
 
-// 2. Get Single Task Detail
 taskRoutes.get("/:id", async (c) => {
   const user = c.get("user");
-  const taskId = c.req.param("id");
-
-  const task = await prisma.task.findFirst({
-    where: { id: taskId, deletedAt: null },
+  const task = await requireTask(prisma, user, c.req.param("id"));
+  const data = await loadTaskDto(prisma, user, task.id);
+  if (user.role === Role.CLIENT) return c.json({ success: true, data });
+  const auditLogs = await prisma.auditLog.findMany({
+    where: { taskId: task.id, projectId: task.projectId },
+    orderBy: [{ timestamp: "desc" }, { id: "desc" }],
+    take: 50,
     include: {
-      project: {
-        select: { id: true, name: true, key: true, clientId: true },
-      },
-      assignee: {
-        select: { id: true, name: true, email: true, department: true, avatarUrl: true },
-      },
-      creator: {
-        select: { id: true, name: true, email: true, department: true },
-      },
-      dependencies: {
-        include: {
-          prerequisiteTask: {
-            select: { id: true, taskCode: true, title: true, status: true, department: true },
-          },
-        },
-      },
-      dependents: {
-        include: {
-          task: {
-            select: { id: true, taskCode: true, title: true, status: true, department: true },
-          },
-        },
-      },
-      attachments: {
-        where: { deletedAt: null },
-        include: {
-          uploader: {
-            select: { id: true, name: true },
-          },
-        },
-      },
-      auditLogs: {
-        orderBy: { timestamp: "desc" },
-        take: 20,
-        include: {
-          user: {
-            select: { id: true, name: true, role: true, department: true, avatarUrl: true },
-          },
-        },
-      },
+      user: { select: { id: true, name: true, role: true, department: true, avatarUrl: true } },
     },
   });
-
-  if (!task) {
-    return c.json({ success: false, error: "Not Found", message: "Task not found." }, 404);
-  }
-
-  const hasAccess = await checkProjectAccess(user.userId, user.role, task.projectId);
-  if (!hasAccess) {
-    return c.json(
-      { success: false, error: "Forbidden", message: "You do not have access to this task." },
-      403,
-    );
-  }
-
-  // Client visibility check
-  if (user.role === Role.CLIENT && !task.isClientVisible) {
-    return c.json(
-      { success: false, error: "Forbidden", message: "This task is not visible to clients." },
-      403,
-    );
-  }
-
-  const depStatus = await getTaskDependencyStatus(task.id);
-  const enriched = {
-    ...task,
-    isBlocked: depStatus.isBlocked,
-    pendingPrerequisites: depStatus.pendingPrerequisites,
-    blockedReason: depStatus.blockedReason,
-  };
-
-  if (user.role === Role.CLIENT) {
-    return c.json({
-      success: true,
-      data: maskTaskForClient(enriched),
-    });
-  }
-
-  return c.json({
-    success: true,
-    data: enriched,
-  });
+  return c.json({ success: true, data: { ...data, auditLogs } });
 });
 
-// 3. Create Task (PM Only)
-const createTaskSchema = z.object({
-  projectId: z.string().uuid(),
-  title: z.string().min(3),
-  description: z.string().optional(),
-  department: z.nativeEnum(Department),
-  priority: z.nativeEnum(Priority).default(Priority.MEDIUM),
-  isClientVisible: z.boolean().default(false),
-  assigneeId: z.string().uuid().optional().nullable(),
-  dueDate: z.string().datetime().optional().nullable(),
-  prerequisiteTaskIds: z.array(z.string().uuid()).optional(),
-});
+const createTaskSchema = z
+  .object({
+    projectId: z.string().uuid(),
+    title: z.string().trim().min(3).max(300),
+    description: z.string().max(20000).optional(),
+    department: departmentSchema,
+    priority: z.nativeEnum(Priority).default(Priority.MEDIUM),
+    isClientVisible: z.boolean().default(false),
+    assigneeId: z.string().uuid().nullable().optional(),
+    dueDate: z.string().datetime({ offset: true }).nullable().optional(),
+    prerequisiteTaskIds: z
+      .array(z.string().uuid())
+      .max(100)
+      .default([])
+      .refine((ids) => new Set(ids).size === ids.length, "Prerequisite IDs must be unique."),
+  })
+  .strict();
 
 taskRoutes.post("/", requireRole(Role.PM), async (c) => {
   const user = c.get("user");
-  const body = await c.req.json();
-  const data = createTaskSchema.parse(body);
-
-  const project = await prisma.project.findFirst({
-    where: { id: data.projectId, deletedAt: null },
-  });
-
-  if (!project) {
-    return c.json({ success: false, error: "Not Found", message: "Project not found." }, 404);
-  }
-
-  // Generate unique task code e.g. "NW-CORE-007"
-  const taskCount = await prisma.task.count({
-    where: { projectId: project.id },
-  });
-  const taskCode = `${project.key}-${String(taskCount + 1).padStart(3, "0")}`;
-
-  const task = await prisma.task.create({
-    data: {
-      taskCode,
-      projectId: project.id,
-      title: data.title,
-      description: data.description,
-      department: data.department,
-      priority: data.priority,
-      isClientVisible: data.isClientVisible,
-      assigneeId: data.assigneeId,
-      creatorId: user.userId,
-      dueDate: data.dueDate ? new Date(data.dueDate) : null,
-      status: TaskStatus.TODO,
-    },
-  });
-
-  // Attach prerequisites if provided
-  if (data.prerequisiteTaskIds && data.prerequisiteTaskIds.length > 0) {
-    for (const prereqId of data.prerequisiteTaskIds) {
-      const cycle = await wouldCreateCycle(task.id, prereqId);
-      if (!cycle) {
-        await prisma.taskDependency.create({
-          data: {
-            taskId: task.id,
-            prerequisiteTaskId: prereqId,
-          },
-        });
-      }
+  const data = createTaskSchema.parse(await c.req.json());
+  await requireProject(prisma, user, data.projectId);
+  const result = await withProjectTransaction(data.projectId, async (tx) => {
+    await assertActiveActor(tx, user);
+    const project = await requireProject(tx, user, data.projectId);
+    await validateTaskAssignee(tx, project.id, data.assigneeId, data.department);
+    // Count includes historical rows; collision probing also tolerates imported codes.
+    let number = (await tx.task.count({ where: { projectId: project.id } })) + 1;
+    let taskCode = `${project.key}-${String(number).padStart(3, "0")}`;
+    while (
+      await tx.task.findFirst({ where: { projectId: project.id, taskCode }, select: { id: true } })
+    ) {
+      number += 1;
+      taskCode = `${project.key}-${String(number).padStart(3, "0")}`;
     }
-
-    // Check if prerequisites are incomplete -> mark BLOCKED
-    const depStatus = await getTaskDependencyStatus(task.id);
-    if (depStatus.isBlocked) {
-      await prisma.task.update({
-        where: { id: task.id },
-        data: { status: TaskStatus.BLOCKED },
-      });
-      task.status = TaskStatus.BLOCKED;
+    const task = await tx.task.create({
+      data: {
+        projectId: project.id,
+        taskCode,
+        title: data.title,
+        description: data.description,
+        department: data.department,
+        priority: data.priority,
+        isClientVisible: data.isClientVisible,
+        assigneeId: data.assigneeId,
+        creatorId: user.userId,
+        dueDate: data.dueDate ? new Date(data.dueDate) : null,
+      },
+    });
+    await recordAuditLog(
+      {
+        projectId: project.id,
+        taskId: task.id,
+        userId: user.userId,
+        action: "TASK_CREATED",
+        changedColumn: "title",
+        newValue: task.title,
+        metadata: {
+          description: task.description,
+          department: task.department,
+          priority: task.priority,
+          assigneeId: task.assigneeId,
+          dueDate: task.dueDate?.toISOString() ?? null,
+          isClientVisible: task.isClientVisible,
+        },
+      },
+      tx,
+    );
+    for (const id of data.prerequisiteTaskIds) {
+      const prerequisite = await requirePrerequisite(tx, task, id);
+      if (await wouldCreateCycle(tx, project.id, task.id, id))
+        throw new HTTPException(400, { message: "Circular dependency detected." });
+      await tx.taskDependency.create({ data: { taskId: task.id, prerequisiteTaskId: id } });
+      await recordAuditLog(
+        {
+          projectId: project.id,
+          taskId: task.id,
+          userId: user.userId,
+          action: "DEPENDENCY_ADDED",
+          changedColumn: "dependencies",
+          newValue: prerequisite.id,
+        },
+        tx,
+      );
     }
-  }
-
-  await recordAuditLog({
-    projectId: project.id,
-    taskId: task.id,
-    userId: user.userId,
-    action: "TASK_CREATED",
-    changedColumn: "title",
-    newValue: task.title,
-    metadata: {
-      taskCode: task.taskCode,
-      department: task.department,
-      priority: task.priority,
-    },
+    const dependency = await getTaskDependencyStatus(task.id, tx);
+    if (dependency.isBlocked) {
+      await tx.task.update({ where: { id: task.id }, data: { status: TaskStatus.BLOCKED } });
+      await statusAudit(tx, user, task, TaskStatus.BLOCKED, "AUTO_BLOCKED");
+    }
+    return loadTaskDto(tx, user, task.id);
   });
-
-  return c.json(
-    {
-      success: true,
-      message: "Task created successfully",
-      data: task,
-    },
-    201,
-  );
+  return c.json({ success: true, message: "Task created successfully", data: result }, 201);
 });
 
-// 4. Update Core Task Details (PM ONLY) with Optimistic Locking
-const updateTaskDetailsSchema = z.object({
-  version: z.number().int().min(1),
-  title: z.string().min(3).optional(),
-  description: z.string().optional().nullable(),
-  department: z.nativeEnum(Department).optional(),
-  priority: z.nativeEnum(Priority).optional(),
-  isClientVisible: z.boolean().optional(),
-  assigneeId: z.string().uuid().optional().nullable(),
-  dueDate: z.string().datetime().optional().nullable(),
-});
+const detailsSchema = z
+  .object({
+    version: versionSchema,
+    title: z.string().trim().min(3).max(300).optional(),
+    description: z.string().max(20000).nullable().optional(),
+    department: departmentSchema.optional(),
+    priority: z.nativeEnum(Priority).optional(),
+    isClientVisible: z.boolean().optional(),
+    assigneeId: z.string().uuid().nullable().optional(),
+    dueDate: z.string().datetime({ offset: true }).nullable().optional(),
+  })
+  .strict();
 
-taskRoutes.put("/:id", requireRole(Role.PM), async (c) => {
+taskRoutes.put("/:id", requireTaskManager, async (c) => {
   const user = c.get("user");
-  const taskId = c.req.param("id");
-  const body = await c.req.json();
-  const data = updateTaskDetailsSchema.parse(body);
-
-  const currentTask = await prisma.task.findFirst({
-    where: { id: taskId, deletedAt: null },
-  });
-
-  if (!currentTask) {
-    return c.json({ success: false, error: "Not Found", message: "Task not found." }, 404);
-  }
-
-  // Optimistic Locking Check
-  if (currentTask.version !== data.version) {
-    return c.json(
-      {
-        success: false,
-        error: "Conflict",
-        message:
-          "This task was modified concurrently by another user. Please refresh and review latest changes.",
-        serverVersion: currentTask.version,
-        clientVersion: data.version,
-        latestData: currentTask,
-      },
-      409,
+  const data = await mutationBody(c, detailsSchema);
+  const result = await taskMutation(user, c.req.param("id"), data.version, async (tx, task) => {
+    await validateTaskAssignee(
+      tx,
+      task.projectId,
+      data.assigneeId === undefined ? task.assigneeId : data.assigneeId,
+      data.department ?? task.department,
     );
-  }
-
-  const updatePayload: Prisma.TaskUncheckedUpdateInput = {
-    version: { increment: 1 },
-  };
-
-  const auditChanges: { column: string; oldVal: string; newVal: string }[] = [];
-
-  if (data.title !== undefined && data.title !== currentTask.title) {
-    updatePayload.title = data.title;
-    auditChanges.push({ column: "title", oldVal: currentTask.title, newVal: data.title });
-  }
-
-  if (data.description !== undefined && data.description !== currentTask.description) {
-    updatePayload.description = data.description;
-    auditChanges.push({
-      column: "description",
-      oldVal: currentTask.description || "",
-      newVal: data.description || "",
-    });
-  }
-
-  if (data.department !== undefined && data.department !== currentTask.department) {
-    updatePayload.department = data.department;
-    auditChanges.push({
-      column: "department",
-      oldVal: currentTask.department,
-      newVal: data.department,
-    });
-  }
-
-  if (data.priority !== undefined && data.priority !== currentTask.priority) {
-    updatePayload.priority = data.priority;
-    auditChanges.push({ column: "priority", oldVal: currentTask.priority, newVal: data.priority });
-  }
-
-  if (data.isClientVisible !== undefined && data.isClientVisible !== currentTask.isClientVisible) {
-    updatePayload.isClientVisible = data.isClientVisible;
-    auditChanges.push({
-      column: "isClientVisible",
-      oldVal: String(currentTask.isClientVisible),
-      newVal: String(data.isClientVisible),
-    });
-  }
-
-  if (data.assigneeId !== undefined && data.assigneeId !== currentTask.assigneeId) {
-    updatePayload.assigneeId = data.assigneeId;
-    auditChanges.push({
-      column: "assigneeId",
-      oldVal: currentTask.assigneeId || "None",
-      newVal: data.assigneeId || "None",
-    });
-  }
-
-  if (data.dueDate !== undefined) {
-    updatePayload.dueDate = data.dueDate ? new Date(data.dueDate) : null;
-    auditChanges.push({
-      column: "dueDate",
-      oldVal: currentTask.dueDate?.toISOString() || "None",
-      newVal: data.dueDate || "None",
-    });
-  }
-
-  // Execute update using version condition
-  const result = await prisma.task.updateMany({
-    where: {
-      id: taskId,
-      version: data.version,
-      deletedAt: null,
-    },
-    data: updatePayload,
-  });
-
-  if (result.count === 0) {
-    const latest = await prisma.task.findUnique({ where: { id: taskId } });
-    return c.json(
-      {
-        success: false,
-        error: "Conflict",
-        message: "Optimistic locking race condition: Record was updated in another transaction.",
-        latestData: latest,
-      },
-      409,
+    const { version: _version, dueDate, ...fields } = data;
+    const changes = {
+      ...fields,
+      ...(dueDate === undefined ? {} : { dueDate: dueDate === null ? null : new Date(dueDate) }),
+    };
+    const changedColumns = (Object.keys(changes) as (keyof typeof changes)[]).filter(
+      (column) => auditValue(task[column]) !== auditValue(changes[column]),
     );
-  }
-
-  const updatedTask = await prisma.task.findUnique({
-    where: { id: taskId },
-    include: {
-      assignee: { select: { id: true, name: true, department: true } },
-    },
+    if (changedColumns.length === 0)
+      throw new HTTPException(422, { message: "No task fields changed." });
+    await bumpTask(tx, user, task, data.version, changes);
+    for (const column of changedColumns) {
+      const oldValue = auditValue(task[column]);
+      const newValue = auditValue(changes[column]);
+      if (oldValue !== newValue)
+        await recordAuditLog(
+          {
+            projectId: task.projectId,
+            taskId: task.id,
+            userId: user.userId,
+            action: "TASK_UPDATED",
+            changedColumn: column,
+            oldValue,
+            newValue,
+          },
+          tx,
+        );
+    }
+    return loadTaskDto(tx, user, task.id);
   });
-
-  // Record audit logs for each changed field
-  for (const change of auditChanges) {
-    await recordAuditLog({
-      projectId: currentTask.projectId,
-      taskId: currentTask.id,
-      userId: user.userId,
-      action: "TASK_UPDATED",
-      changedColumn: change.column,
-      oldValue: change.oldVal,
-      newValue: change.newVal,
-    });
-  }
-
-  return c.json({
-    success: true,
-    message: "Task updated successfully",
-    data: updatedTask,
-  });
+  return c.json({ success: true, message: "Task updated successfully", data: result });
 });
 
-// 5. Update Task Status (STATE-BASED ACCESS CONTROL + OPTIMISTIC LOCKING)
-const updateStatusSchema = z.object({
-  status: z.nativeEnum(TaskStatus),
-  version: z.number().int().min(1),
-  note: z.string().optional(),
-});
-
+const statusSchema = z
+  .object({
+    version: versionSchema,
+    status: z.nativeEnum(TaskStatus),
+    note: z.string().max(2000).optional(),
+  })
+  .strict();
 taskRoutes.patch("/:id/status", async (c) => {
   const user = c.get("user");
-  const taskId = c.req.param("id");
-  const body = await c.req.json();
-  const data = updateStatusSchema.parse(body);
-
-  const task = await prisma.task.findFirst({
-    where: { id: taskId, deletedAt: null },
-    include: { project: true },
-  });
-
-  if (!task) {
-    return c.json({ success: false, error: "Not Found", message: "Task not found." }, 404);
-  }
-
-  const hasAccess = await checkProjectAccess(user.userId, user.role, task.projectId);
-  if (!hasAccess) {
-    return c.json(
-      { success: false, error: "Forbidden", message: "You do not have access to this task." },
-      403,
-    );
-  }
-
-  // Client cannot change status
-  if (user.role === Role.CLIENT) {
-    return c.json(
-      { success: false, error: "Forbidden", message: "Client guests cannot modify task status." },
-      403,
-    );
-  }
-
-  // CRITICAL RULE 1: PM CANNOT move a task from IN_PROGRESS to DONE!
-  // "Has full read/write access to projects and tasks, but cannot move a task status from In Progress to Done (only the executor can complete it)."
-  if (
-    user.role === Role.PM &&
-    task.status === TaskStatus.IN_PROGRESS &&
-    data.status === TaskStatus.DONE
-  ) {
-    return c.json(
-      {
-        success: false,
-        error: "Forbidden",
-        message:
-          "Product Managers cannot mark tasks as Done. Only the assigned executor / internal team member can complete an in-progress deliverable.",
-      },
-      403,
-    );
-  }
-
-  // CRITICAL RULE 2: Internal Team members can only change status for their relevant tasks
-  // (Either assigned directly, or matching their department)
-  if (user.role === Role.MEMBER) {
-    if (task.assigneeId && task.assigneeId !== user.userId && task.department !== user.department) {
-      return c.json(
-        {
-          success: false,
-          error: "Forbidden",
-          message: `You are not the assignee or from department ${task.department} for this task.`,
-        },
-        403,
-      );
-    }
-  }
-
-  // CRITICAL RULE 3: DEPENDENCY ENFORCEMENT & BLOCKED STATE
-  // "A Frontend Engineer can only change a task status to In Progress if the UI/UX task it depends on is already Done. If not, the action button must be locked both in UI and API protection."
-  if (data.status === TaskStatus.IN_PROGRESS || data.status === TaskStatus.DONE) {
-    const depStatus = await getTaskDependencyStatus(task.id);
-    if (depStatus.isBlocked) {
-      return c.json(
-        {
-          success: false,
-          error: "TaskBlocked",
-          message: `Cannot transition task to ${data.status}: It has incomplete prerequisite dependencies.`,
-          pendingPrerequisites: depStatus.pendingPrerequisites,
-          blockedReason: depStatus.blockedReason,
-        },
-        422,
-      );
-    }
-  }
-
-  // CRITICAL RULE 4: OPTIMISTIC LOCKING / RACE CONDITION CHECK
-  if (task.version !== data.version) {
-    return c.json(
-      {
-        success: false,
-        error: "Conflict",
-        message:
-          "Concurrency conflict: This task status was changed by another user. Please reload.",
-        serverVersion: task.version,
-        clientVersion: data.version,
-        latestData: task,
-      },
-      409,
-    );
-  }
-
-  // Perform atomic update with version check
-  const updateResult = await prisma.task.updateMany({
-    where: {
-      id: taskId,
-      version: data.version,
-      deletedAt: null,
-    },
-    data: {
-      status: data.status,
-      version: { increment: 1 },
-    },
-  });
-
-  if (updateResult.count === 0) {
-    const latest = await prisma.task.findUnique({ where: { id: taskId } });
-    return c.json(
-      {
-        success: false,
-        error: "Conflict",
-        message: "Conflict: Task was modified concurrently by another user.",
-        latestData: latest,
-      },
-      409,
-    );
-  }
-
-  // If marked DONE, automatically check if any dependent tasks can now be unblocked!
-  if (data.status === TaskStatus.DONE) {
-    const dependents = await prisma.taskDependency.findMany({
-      where: { prerequisiteTaskId: taskId },
-      select: { taskId: true },
-    });
-
-    for (const dep of dependents) {
-      const depCheck = await getTaskDependencyStatus(dep.taskId);
-      if (!depCheck.isBlocked) {
-        // All prerequisites are now DONE! If the dependent task was BLOCKED, transition it to TODO
-        const dependentTask = await prisma.task.findUnique({ where: { id: dep.taskId } });
-        if (dependentTask && dependentTask.status === TaskStatus.BLOCKED) {
-          await prisma.task.update({
-            where: { id: dep.taskId },
-            data: {
-              status: TaskStatus.TODO,
-              version: { increment: 1 },
-            },
-          });
-
-          await recordAuditLog({
-            projectId: task.projectId,
-            taskId: dep.taskId,
-            userId: user.userId,
-            action: "AUTO_UNBLOCKED",
-            changedColumn: "status",
-            oldValue: TaskStatus.BLOCKED,
-            newValue: TaskStatus.TODO,
-            metadata: { unblockedBy: task.taskCode },
-          });
-        }
-      }
-    }
-  }
-
-  // Record Audit Trail
-  await recordAuditLog({
-    projectId: task.projectId,
-    taskId: task.id,
-    userId: user.userId,
-    action: "STATUS_CHANGED",
-    changedColumn: "status",
-    oldValue: task.status,
-    newValue: data.status,
-    metadata: {
-      note: data.note || null,
-      updatedByRole: user.role,
-      updatedByDepartment: user.department,
-    },
-  });
-
-  const updatedTask = await prisma.task.findUnique({
-    where: { id: taskId },
-    include: {
-      assignee: { select: { id: true, name: true, department: true } },
-    },
-  });
-
-  return c.json({
-    success: true,
-    message: `Task status updated from ${task.status} to ${data.status}`,
-    data: updatedTask,
-  });
-});
-
-// 6. Manage Task Dependencies (PM Only)
-taskRoutes.post("/:id/dependencies", requireRole(Role.PM), async (c) => {
-  const user = c.get("user");
-  const taskId = c.req.param("id");
-  const { prerequisiteTaskId } = await c.req.json();
-
-  if (!prerequisiteTaskId || taskId === prerequisiteTaskId) {
-    return c.json(
-      { success: false, error: "Validation Error", message: "A task cannot depend on itself." },
-      400,
-    );
-  }
-
-  const [task, prereq] = await Promise.all([
-    prisma.task.findFirst({ where: { id: taskId, deletedAt: null } }),
-    prisma.task.findFirst({ where: { id: prerequisiteTaskId, deletedAt: null } }),
-  ]);
-
-  if (!task || !prereq) {
-    return c.json(
-      { success: false, error: "Not Found", message: "Task or prerequisite not found." },
-      404,
-    );
-  }
-
-  if (task.projectId !== prereq.projectId) {
-    return c.json(
-      {
-        success: false,
-        error: "Validation Error",
-        message: "Prerequisites must belong to the same project.",
-      },
-      400,
-    );
-  }
-
-  // Check DAG cycle
-  const hasCycle = await wouldCreateCycle(taskId, prerequisiteTaskId);
-  if (hasCycle) {
-    return c.json(
-      {
-        success: false,
-        error: "CircularDependency",
-        message: `Circular dependency detected: Adding '${prereq.taskCode}' as prerequisite for '${task.taskCode}' creates an infinite cycle.`,
-      },
-      400,
-    );
-  }
-
-  const existing = await prisma.taskDependency.findUnique({
-    where: {
-      taskId_prerequisiteTaskId: {
-        taskId,
-        prerequisiteTaskId,
-      },
-    },
-  });
-
-  if (existing) {
-    return c.json(
-      { success: false, error: "Conflict", message: "Dependency already exists." },
-      409,
-    );
-  }
-
-  await prisma.taskDependency.create({
-    data: { taskId, prerequisiteTaskId },
-  });
-
-  // If newly added prerequisite is NOT DONE, automatically set task status to BLOCKED if it's currently TODO or IN_PROGRESS
-  if (prereq.status !== TaskStatus.DONE) {
-    if (task.status === TaskStatus.TODO || task.status === TaskStatus.IN_PROGRESS) {
-      await prisma.task.update({
-        where: { id: taskId },
-        data: { status: TaskStatus.BLOCKED, version: { increment: 1 } },
+  const data = await mutationBody(c, statusSchema);
+  const result = await taskMutation(user, c.req.param("id"), data.version, async (tx, task) => {
+    if (data.status === TaskStatus.IN_PROGRESS || data.status === TaskStatus.DONE) {
+      if (user.role === Role.PM || task.assigneeId !== user.userId)
+        throw new HTTPException(403, {
+          message:
+            "Only the assigned member may start or complete execution. Product Managers cannot mark tasks as Done.",
+        });
+      const dependency = await getTaskDependencyStatus(task.id, tx);
+      if (dependency.isBlocked)
+        throw new HTTPException(422, {
+          message: "TaskBlocked: task has incomplete prerequisite dependencies.",
+        });
+      if (
+        (data.status === TaskStatus.IN_PROGRESS && task.status !== TaskStatus.TODO) ||
+        (data.status === TaskStatus.DONE && task.status !== TaskStatus.IN_PROGRESS)
+      )
+        throw new HTTPException(422, {
+          message: "Invalid status transition. Start a TODO task before completing it.",
+        });
+    } else if (user.role === Role.MEMBER && task.assigneeId !== user.userId) {
+      throw new HTTPException(403, {
+        message: "Only the assigned member may change this task status.",
       });
     }
-  }
-
-  await recordAuditLog({
-    projectId: task.projectId,
-    taskId: task.id,
-    userId: user.userId,
-    action: "DEPENDENCY_ADDED",
-    changedColumn: "dependencies",
-    oldValue: null,
-    newValue: prereq.taskCode,
-    metadata: { prerequisiteTitle: prereq.title },
-  });
-
-  return c.json({
-    success: true,
-    message: `Added dependency: ${task.taskCode} now depends on ${prereq.taskCode}`,
-  });
-});
-
-// Remove Dependency (PM Only)
-taskRoutes.delete("/:id/dependencies/:prereqId", requireRole(Role.PM), async (c) => {
-  const user = c.get("user");
-  const taskId = c.req.param("id");
-  const prereqId = c.req.param("prereqId");
-
-  const dep = await prisma.taskDependency.findUnique({
-    where: {
-      taskId_prerequisiteTaskId: {
-        taskId,
-        prerequisiteTaskId: prereqId,
+    if (task.status === data.status)
+      throw new HTTPException(422, { message: "Task already has this status." });
+    const dependency = await getTaskDependencyStatus(task.id, tx);
+    if (data.status === TaskStatus.TODO && dependency.isBlocked)
+      throw new HTTPException(422, {
+        message: "TaskBlocked: task has incomplete prerequisite dependencies.",
+      });
+    await bumpTask(tx, user, task, data.version, { status: data.status });
+    await recordAuditLog(
+      {
+        projectId: task.projectId,
+        taskId: task.id,
+        userId: user.userId,
+        action: "STATUS_CHANGED",
+        changedColumn: "status",
+        oldValue: task.status,
+        newValue: data.status,
+        metadata: { note: data.note ?? null },
       },
-    },
-    include: {
-      task: true,
-      prerequisiteTask: true,
-    },
-  });
-
-  if (!dep) {
-    return c.json(
-      { success: false, error: "Not Found", message: "Dependency does not exist." },
-      404,
+      tx,
     );
-  }
-
-  await prisma.taskDependency.delete({
-    where: {
-      taskId_prerequisiteTaskId: {
-        taskId,
-        prerequisiteTaskId: prereqId,
-      },
-    },
+    await syncProjectBlocking(tx, user, task.projectId, [task.id]);
+    return loadTaskDto(tx, user, task.id);
   });
+  return c.json({ success: true, message: "Task status updated successfully", data: result });
+});
 
-  // If removing this prerequisite leaves no incomplete prerequisites, unblock task
-  const depStatus = await getTaskDependencyStatus(taskId);
-  if (!depStatus.isBlocked && dep.task.status === TaskStatus.BLOCKED) {
-    await prisma.task.update({
-      where: { id: taskId },
-      data: { status: TaskStatus.TODO, version: { increment: 1 } },
+const dependencySchema = z
+  .object({ version: versionSchema, prerequisiteTaskId: z.string().uuid() })
+  .strict();
+taskRoutes.post("/:id/dependencies", requireTaskManager, async (c) => {
+  const user = c.get("user");
+  const data = await mutationBody(c, dependencySchema);
+  const result = await taskMutation(user, c.req.param("id"), data.version, async (tx, task) => {
+    const prerequisite = await requirePrerequisite(tx, task, data.prerequisiteTaskId);
+    if (await wouldCreateCycle(tx, task.projectId, task.id, prerequisite.id))
+      throw new HTTPException(400, { message: "Circular dependency detected." });
+    if (
+      await tx.taskDependency.findFirst({
+        where: { taskId: task.id, prerequisiteTaskId: prerequisite.id, deletedAt: null },
+      })
+    )
+      throw new TaskConflict(task.id, data.version, "Dependency already exists.");
+    await tx.taskDependency.create({
+      data: { taskId: task.id, prerequisiteTaskId: prerequisite.id },
     });
+    const blocked = (await getTaskDependencyStatus(task.id, tx)).isBlocked;
+    const status = blocked ? TaskStatus.BLOCKED : task.status;
+    await bumpTask(tx, user, task, data.version, { status });
+    await recordAuditLog(
+      {
+        projectId: task.projectId,
+        taskId: task.id,
+        userId: user.userId,
+        action: "DEPENDENCY_ADDED",
+        changedColumn: "dependencies",
+        newValue: prerequisite.id,
+      },
+      tx,
+    );
+    if (status !== task.status) await statusAudit(tx, user, task, status, "AUTO_BLOCKED");
+    await syncProjectBlocking(tx, user, task.projectId, [task.id]);
+    return loadTaskDto(tx, user, task.id);
+  });
+  return c.json({ success: true, message: "Dependency added successfully", data: result });
+});
+
+taskRoutes.delete("/:id/dependencies/:prereqId", requireTaskManager, async (c) => {
+  const user = c.get("user");
+  const data = await mutationBody(c, versionBody);
+  const prerequisiteId = z.string().uuid().parse(c.req.param("prereqId"));
+  const result = await taskMutation(user, c.req.param("id"), data.version, async (tx, task) => {
+    await requirePrerequisite(tx, task, prerequisiteId);
+    const edge = await tx.taskDependency.findFirst({
+      where: { taskId: task.id, prerequisiteTaskId: prerequisiteId, deletedAt: null },
+    });
+    if (!edge) throw new HTTPException(404, { message: "Dependency not found." });
+    await tx.taskDependency.update({ where: { id: edge.id }, data: { deletedAt: new Date() } });
+    const blocked = (await getTaskDependencyStatus(task.id, tx)).isBlocked;
+    const status = !blocked && task.status === TaskStatus.BLOCKED ? TaskStatus.TODO : task.status;
+    await bumpTask(tx, user, task, data.version, { status });
+    await recordAuditLog(
+      {
+        projectId: task.projectId,
+        taskId: task.id,
+        userId: user.userId,
+        action: "DEPENDENCY_REMOVED",
+        changedColumn: "dependencies",
+        oldValue: prerequisiteId,
+      },
+      tx,
+    );
+    if (status !== task.status) await statusAudit(tx, user, task, status, "AUTO_UNBLOCKED");
+    await syncProjectBlocking(tx, user, task.projectId, [task.id]);
+    return loadTaskDto(tx, user, task.id);
+  });
+  return c.json({ success: true, message: "Dependency removed successfully", data: result });
+});
+
+function safeLink(value: string) {
+  if (
+    [...value].some((character) => character.charCodeAt(0) <= 32 || character.charCodeAt(0) === 127)
+  )
+    return false;
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    return (
+      url.protocol === "https:" &&
+      !url.username &&
+      !url.password &&
+      host.includes(".") &&
+      !host.endsWith(".") &&
+      !/^(?:\d{1,3}\.){3}\d{1,3}$/.test(host) &&
+      !host.includes(":") &&
+      !["localhost", "local", "internal", "test", "invalid"].some(
+        (suffix) => host === suffix || host.endsWith(`.${suffix}`),
+      )
+    );
+  } catch {
+    return false;
   }
-
-  await recordAuditLog({
-    projectId: dep.task.projectId,
-    taskId: dep.taskId,
-    userId: user.userId,
-    action: "DEPENDENCY_REMOVED",
-    changedColumn: "dependencies",
-    oldValue: dep.prerequisiteTask.taskCode,
-    newValue: null,
-  });
-
-  return c.json({
-    success: true,
-    message: `Removed dependency: ${dep.task.taskCode} no longer depends on ${dep.prerequisiteTask.taskCode}`,
-  });
-});
-
-// 7. Work Attachments (Internal Team & PM)
-const createAttachmentSchema = z.object({
-  fileName: z.string().min(2),
-  fileUrl: z.string().url(),
-  fileType: z.string().optional(),
-});
+}
+const attachmentSchema = z
+  .object({
+    version: versionSchema,
+    fileName: z
+      .string()
+      .trim()
+      .min(1)
+      .max(255)
+      .refine(
+        (value) =>
+          !value.includes("/") &&
+          !value.includes("\\") &&
+          !value.includes("..") &&
+          value !== "." &&
+          [...value].every(
+            (character) => character.charCodeAt(0) >= 32 && character.charCodeAt(0) !== 127,
+          ),
+        "Use a plain filename, not a path.",
+      ),
+    fileUrl: z
+      .string()
+      .max(4096)
+      .refine(safeLink, "Use an HTTPS link to a public hostname without credentials.")
+      .url(),
+    fileType: z
+      .string()
+      .max(127)
+      .regex(/^(?:link|[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*)$/)
+      .default("link"),
+    fileSize: z
+      .number()
+      .int()
+      .min(0)
+      .max(25 * 1024 * 1024)
+      .optional(),
+  })
+  .strict();
 
 taskRoutes.post("/:id/attachments", async (c) => {
   const user = c.get("user");
-  const taskId = c.req.param("id");
-  const body = await c.req.json();
-  const data = createAttachmentSchema.parse(body);
-
-  if (user.role === Role.CLIENT) {
-    return c.json(
-      { success: false, error: "Forbidden", message: "Clients cannot upload attachments." },
-      403,
+  const data = await mutationBody(c, attachmentSchema);
+  const result = await taskMutation(user, c.req.param("id"), data.version, async (tx, task) => {
+    requireInternal(user);
+    await bumpTask(tx, user, task, data.version);
+    const attachment = await tx.taskAttachment.create({
+      data: {
+        taskId: task.id,
+        uploaderId: user.userId,
+        fileName: data.fileName,
+        fileUrl: data.fileUrl,
+        fileType: data.fileType,
+        fileSize: data.fileSize,
+      },
+      include: { uploader: { select: { id: true, name: true } } },
+    });
+    await recordAuditLog(
+      {
+        projectId: task.projectId,
+        taskId: task.id,
+        userId: user.userId,
+        action: "ATTACHMENT_ADDED",
+        changedColumn: "attachments",
+        newValue: attachment.id,
+        metadata: { fileName: attachment.fileName },
+      },
+      tx,
     );
-  }
-
-  const task = await prisma.task.findFirst({
-    where: { id: taskId, deletedAt: null },
+    return attachment;
   });
-
-  if (!task) {
-    return c.json({ success: false, error: "Not Found", message: "Task not found." }, 404);
-  }
-
-  const attachment = await prisma.taskAttachment.create({
-    data: {
-      taskId: task.id,
-      uploaderId: user.userId,
-      fileName: data.fileName,
-      fileUrl: data.fileUrl,
-      fileType: data.fileType || "link",
-    },
-    include: {
-      uploader: { select: { id: true, name: true } },
-    },
-  });
-
-  await recordAuditLog({
-    projectId: task.projectId,
-    taskId: task.id,
-    userId: user.userId,
-    action: "ATTACHMENT_ADDED",
-    changedColumn: "attachments",
-    newValue: attachment.fileName,
-    metadata: { fileUrl: attachment.fileUrl },
-  });
-
   return c.json(
-    {
-      success: true,
-      message: "Attachment uploaded successfully",
-      data: attachment,
-    },
+    { success: true, message: "Attachment link added successfully", data: result },
     201,
   );
 });
 
-// Soft Delete Task (PM Only)
-taskRoutes.delete("/:id", requireRole(Role.PM), async (c) => {
+taskRoutes.delete("/:id/attachments/:attachmentId", async (c) => {
   const user = c.get("user");
-  const taskId = c.req.param("id");
-
-  const task = await prisma.task.findFirst({
-    where: { id: taskId, deletedAt: null },
+  const data = await mutationBody(c, versionBody);
+  const attachmentId = z.string().uuid().parse(c.req.param("attachmentId"));
+  await taskMutation(user, c.req.param("id"), data.version, async (tx, task) => {
+    requireInternal(user);
+    const attachment = await tx.taskAttachment.findFirst({
+      where: { id: attachmentId, taskId: task.id, deletedAt: null },
+    });
+    if (!attachment) throw new HTTPException(404, { message: "Attachment not found." });
+    if (user.role !== Role.PM && attachment.uploaderId !== user.userId)
+      throw new HTTPException(403, {
+        message: "Only the uploader or a PM may remove this attachment link.",
+      });
+    await bumpTask(tx, user, task, data.version);
+    await tx.taskAttachment.update({
+      where: { id: attachment.id },
+      data: { deletedAt: new Date() },
+    });
+    await recordAuditLog(
+      {
+        projectId: task.projectId,
+        taskId: task.id,
+        userId: user.userId,
+        action: "ATTACHMENT_DELETED",
+        changedColumn: "attachments",
+        oldValue: attachment.id,
+      },
+      tx,
+    );
   });
+  return c.json({ success: true, message: "Attachment link soft-deleted successfully" });
+});
 
-  if (!task) {
-    return c.json({ success: false, error: "Not Found", message: "Task not found." }, 404);
-  }
-
-  await prisma.task.update({
-    where: { id: taskId },
-    data: { deletedAt: new Date() },
+taskRoutes.delete("/:id", requireTaskManager, async (c) => {
+  const user = c.get("user");
+  const data = await mutationBody(c, versionBody);
+  await taskMutation(user, c.req.param("id"), data.version, async (tx, task) => {
+    const deletedAt = new Date();
+    await bumpTask(tx, user, task, data.version, { deletedAt });
+    const edges = await tx.taskDependency.findMany({
+      where: {
+        deletedAt: null,
+        task: { projectId: task.projectId },
+        OR: [{ taskId: task.id }, { prerequisiteTaskId: task.id }],
+      },
+    });
+    for (const edge of edges) {
+      await tx.taskDependency.update({ where: { id: edge.id }, data: { deletedAt } });
+      await recordAuditLog(
+        {
+          projectId: task.projectId,
+          taskId: edge.taskId,
+          userId: user.userId,
+          action: "DEPENDENCY_REMOVED",
+          changedColumn: "dependencies",
+          oldValue: edge.prerequisiteTaskId,
+          metadata: { deletedTaskId: task.id },
+        },
+        tx,
+      );
+    }
+    const affectedTasks = [
+      ...new Set(edges.filter((edge) => edge.taskId !== task.id).map((edge) => edge.taskId)),
+    ];
+    for (const id of affectedTasks) {
+      const dependent = await requireTask(tx, user, id);
+      const dependency = await getTaskDependencyStatus(id, tx);
+      const status =
+        !dependency.isBlocked && dependent.status === TaskStatus.BLOCKED
+          ? TaskStatus.TODO
+          : dependent.status;
+      await bumpTask(tx, user, dependent, dependent.version, { status });
+      if (status !== dependent.status)
+        await statusAudit(tx, user, dependent, status, "AUTO_UNBLOCKED");
+    }
+    await recordAuditLog(
+      {
+        projectId: task.projectId,
+        taskId: task.id,
+        userId: user.userId,
+        action: "TASK_SOFT_DELETED",
+        changedColumn: "deletedAt",
+        newValue: deletedAt.toISOString(),
+      },
+      tx,
+    );
+    await syncProjectBlocking(tx, user, task.projectId, affectedTasks);
   });
-
-  await recordAuditLog({
-    projectId: task.projectId,
-    taskId: task.id,
-    userId: user.userId,
-    action: "TASK_SOFT_DELETED",
-    changedColumn: "deletedAt",
-    oldValue: null,
-    newValue: new Date().toISOString(),
-  });
-
-  return c.json({
-    success: true,
-    message: "Task soft-deleted successfully",
-  });
+  return c.json({ success: true, message: "Task soft-deleted successfully" });
 });
 
 export { taskRoutes };

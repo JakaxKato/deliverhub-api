@@ -53,8 +53,24 @@ model User {
   clientProjects     Project[]       @relation("ClientProjects")
   auditLogs          AuditLog[]
   attachments        TaskAttachment[]
+  comments           Comment[]
+  sessions           Session[]
 
   @@map("users")
+}
+
+model Session {
+  jti       String    @id @default(uuid())
+  userId    String
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
 }
 
 model Project {
@@ -71,6 +87,7 @@ model Project {
   members     ProjectMember[]
   tasks       Task[]
   auditLogs   AuditLog[]
+  comments    Comment[]
 
   @@map("projects")
 }
@@ -80,6 +97,7 @@ model ProjectMember {
   projectId  String
   userId     String
   assignedAt DateTime @default(now())
+  deletedAt  DateTime?
 
   project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
   user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -112,6 +130,7 @@ model Task {
   dependencies    TaskDependency[] @relation("TaskToPrerequisites")
   dependents      TaskDependency[] @relation("PrerequisiteToTasks")
   attachments     TaskAttachment[]
+  comments        Comment[]
   auditLogs       AuditLog[]
 
   @@unique([projectId, taskCode])
@@ -123,11 +142,13 @@ model TaskDependency {
   taskId             String
   prerequisiteTaskId String
   createdAt          DateTime @default(now())
+  deletedAt          DateTime?
 
   task               Task     @relation("TaskToPrerequisites", fields: [taskId], references: [id], onDelete: Cascade)
   prerequisiteTask   Task     @relation("PrerequisiteToTasks", fields: [prerequisiteTaskId], references: [id], onDelete: Cascade)
 
-  @@unique([taskId, prerequisiteTaskId])
+  // Active-pair uniqueness is enforced by the partial SQL index in 0002_security.
+  @@index([taskId, prerequisiteTaskId])
   @@map("task_dependencies")
 }
 
@@ -148,6 +169,25 @@ model TaskAttachment {
   @@map("task_attachments")
 }
 
+model Comment {
+  id        String    @id @default(uuid())
+  taskId    String
+  projectId String
+  authorId  String
+  body      String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  task      Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  project   Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  author    User      @relation(fields: [authorId], references: [id])
+
+  @@index([taskId, createdAt])
+  @@index([projectId])
+  @@map("comments")
+}
+
 model AuditLog {
   id            String   @id @default(uuid())
   projectId     String
@@ -160,9 +200,9 @@ model AuditLog {
   metadata      Json?
   timestamp     DateTime @default(now())
 
-  project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  task          Task?    @relation(fields: [taskId], references: [id], onDelete: SetNull)
-  user          User     @relation(fields: [userId], references: [id])
+  project       Project  @relation(fields: [projectId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  task          Task?    @relation(fields: [taskId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  user          User     @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: Restrict)
 
   @@map("audit_logs")
 }

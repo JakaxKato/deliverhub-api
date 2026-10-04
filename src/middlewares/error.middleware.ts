@@ -1,6 +1,8 @@
+import { Prisma } from "@prisma/client";
 import type { ErrorHandler } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { ZodError } from "zod";
+import { env } from "../config/env";
 
 export const errorHandler: ErrorHandler = (err, c) => {
   if (err instanceof ZodError) {
@@ -9,9 +11,9 @@ export const errorHandler: ErrorHandler = (err, c) => {
         success: false,
         error: "Validation Error",
         message: "Invalid input payload provided",
-        issues: err.issues.map((i) => ({
-          field: i.path.join("."),
-          message: i.message,
+        issues: err.issues.map((issue) => ({
+          field: issue.path.join("."),
+          message: issue.message,
         })),
       },
       400,
@@ -22,20 +24,45 @@ export const errorHandler: ErrorHandler = (err, c) => {
     return c.json(
       {
         success: false,
-        error: err.name || "HTTP Error",
-        message: err.message,
+        error: "HTTP Error",
+        message:
+          err.status >= 500 && env.NODE_ENV === "production"
+            ? "An unexpected error occurred."
+            : err.message,
       },
       err.status,
     );
   }
 
-  console.error("Unhandled Application Error:", err);
+  if (err instanceof SyntaxError && err.message.includes("JSON")) {
+    return c.json(
+      { success: false, error: "Validation Error", message: "Invalid JSON payload" },
+      400,
+    );
+  }
 
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    if (err.code === "P2002" || err.code === "P2034") {
+      return c.json(
+        {
+          success: false,
+          error: "Conflict",
+          message: "The operation conflicts with existing data. Refresh and retry.",
+        },
+        409,
+      );
+    }
+    if (err.code === "P2025") {
+      return c.json({ success: false, error: "Not Found", message: "Resource not found." }, 404);
+    }
+  }
+
+  console.error("Unhandled application error:", err);
   return c.json(
     {
       success: false,
       error: "Internal Server Error",
-      message: err.message || "An unexpected error occurred.",
+      message: env.NODE_ENV === "production" ? "An unexpected error occurred." : err.message,
     },
     500,
   );
