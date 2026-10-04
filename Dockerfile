@@ -1,4 +1,4 @@
-# Railway deployment for DeliverHub API (Bun + Hono + Prisma)
+# Production image for DeliverHub API (Bun + Hono + Prisma)
 FROM oven/bun:1 AS base
 WORKDIR /app
 

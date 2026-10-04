@@ -184,6 +184,21 @@ GET /api/tasks?rangedFilters=[{"key":"version","start":1,"end":5}]
 
 URL-encode JSON values when constructing actual URLs.
 
+## Deployment
+
+The API builds as a portable Docker image (`Dockerfile`, base `oven/bun:1`), so any
+container host works. The reference deployment runs on **Render** as a Docker web service
+with a managed PostgreSQL instance:
+
+- Required env: `DATABASE_URL`, `JWT_SECRET` (>= 32 chars), `CORS_ORIGIN` (exact origins,
+  no wildcards). Optional: `JWT_ISSUER`, `JWT_AUDIENCE`, `JWT_EXPIRES_IN`. Do not set
+  `PORT` where the host injects it (Render does).
+- Health check path: `/health`.
+- On boot `bun scripts/start.ts` validates configuration, runs `prisma migrate deploy`,
+  then serves. It **never seeds**. Create the demo accounts with a one-off
+  `bun run db:seed` (set `SEED_PASSWORD`, and `ALLOW_PRODUCTION_SEED=true` in production),
+  then remove those variables.
+
 ## Commands and validation
 
 - `bun run dev`: watch-mode development server (does not migrate or seed).
